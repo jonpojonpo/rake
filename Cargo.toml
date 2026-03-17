@@ -1,0 +1,29 @@
+[package]
+name = "rake"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rake"
+path = "src/main.rs"
+
+[features]
+default = []
+llamacpp = ["dep:llama-cpp-2"]
+
+[dependencies]
+wasmtime = { version = "27", features = ["cranelift"] }
+wasmtime-wasi = "27"
+anyhow = "1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bitflags = "2"
+bytes = "1"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+csv = "1"
+
+# native llama.cpp inference (opt-in: cargo build --features llamacpp)
+llama-cpp-2 = { version = "0.1", optional = true }

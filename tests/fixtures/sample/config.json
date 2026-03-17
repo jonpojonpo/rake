@@ -1,0 +1,20 @@
+{
+  "app_name": "DataProcessor v1.0",
+  "debug": true,
+  "log_level": "DEBUG",
+  "users": [
+    {"name": "Alice", "email": "alice@example.com", "age": 25},
+    {"name": "Bob",   "email": "bob@example.com",   "age": 16},
+    {"name": "Charlie; rm -rf /", "email": "evil@example.com", "age": 30}
+  ],
+  "database": {
+    "host": "prod-db.internal",
+    "port": 5432,
+    "name": "users",
+    "pool_size": 10
+  },
+  "feature_flags": {
+    "new_auth": false,
+    "beta_dashboard": true
+  }
+}
