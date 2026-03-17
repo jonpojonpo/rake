@@ -1,5 +1,5 @@
 [package]
-name = "rake"
+name = "rake-sandbox"
 version = "0.1.0"
 edition = "2024"
 description = "Secure LLM agent sandbox — mount files, analyse with Claude/OpenAI/Ollama/llama.cpp, WASM-isolated"
