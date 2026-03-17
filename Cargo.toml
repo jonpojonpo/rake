@@ -2,6 +2,14 @@
 name = "rake"
 version = "0.1.0"
 edition = "2024"
+description = "Secure LLM agent sandbox — mount files, analyse with Claude/OpenAI/Ollama/llama.cpp, WASM-isolated"
+license = "MIT"
+repository = "https://github.com/jonpojonpo/rake"
+homepage = "https://github.com/jonpojonpo/rake"
+documentation = "https://github.com/jonpojonpo/rake#readme"
+keywords = ["llm", "agent", "wasm", "sandbox", "analysis"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
 
 [[bin]]
 name = "rake"
