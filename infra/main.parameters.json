@@ -1,0 +1,29 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "eastus"
+    },
+    "suffix": {
+      "value": "YOUR_UNIQUE_SUFFIX"
+    },
+    "imageTag": {
+      "value": "latest"
+    },
+    "anthropicApiKey": {
+      "reference": {
+        "keyVault": {
+          "id": "/subscriptions/YOUR_SUBSCRIPTION_ID/resourceGroups/rg-rake/providers/Microsoft.KeyVault/vaults/kv-rake-YOUR_SUFFIX"
+        },
+        "secretName": "anthropic-api-key"
+      }
+    },
+    "minReplicas": {
+      "value": 0
+    },
+    "maxReplicas": {
+      "value": 10
+    }
+  }
+}
