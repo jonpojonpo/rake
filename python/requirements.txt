@@ -1,13 +1,16 @@
-# Azure Functions runtime
-azure-functions>=1.18.0
+# Core (always needed)
+boto3>=1.34.0
 
-# Azure SDK
-azure-storage-blob>=12.19.0
-azure-servicebus>=7.11.0
-azure-identity>=1.15.0
+# Office document conversion (for DOCX, XLSX, PPTX, PDF)
+python-docx>=1.1.0
+openpyxl>=3.1.0
+python-pptx>=0.6.23
+pdfminer.six>=20221105
+
+# Optional: local dev server
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+httpx>=0.27.0
 
 # Telemetry
-applicationinsights>=0.11.10
-
-# rake Python SDK (local install — see pyproject.toml for production)
-# rake-sdk  # install from PyPI once published
+aws-xray-sdk>=2.12.0

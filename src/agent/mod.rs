@@ -216,6 +216,24 @@ fn agent_tools() -> Vec<ToolDef> {
             }),
         ),
         ToolDef::new(
+            "read_section",
+            "Read a specific line range from a file (1-indexed, inclusive). \
+             ALWAYS prefer this over read_file for large documents. \
+             Check the _index.md file first to find section line ranges, \
+             then call read_section to fetch only the section you need. \
+             Example: read_section(path='report.md', start_line=100, end_line=235) \
+             reads only the Chairman's Statement without loading the full document.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path":       { "type": "string", "description": "File path" },
+                    "start_line": { "type": "integer", "description": "First line to read (1-indexed)" },
+                    "end_line":   { "type": "integer", "description": "Last line to read (inclusive)" }
+                },
+                "required": ["path", "start_line", "end_line"]
+            }),
+        ),
+        ToolDef::new(
             "file_info",
             "Return metadata about a file: size, line count, extension, mime type.",
             serde_json::json!({
@@ -437,6 +455,15 @@ When you have completed a thorough analysis, call `done` with a detailed Markdow
                     .ok_or_else(|| anyhow::anyhow!("head requires path"))?;
                 let n = input["lines"].as_u64().unwrap_or(30) as usize;
                 tools::head(&self.sandbox, path, n)
+            }
+            "read_section" => {
+                let path = input["path"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("read_section requires path"))?;
+                let start = input["start_line"].as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("read_section requires start_line"))? as usize;
+                let end = input["end_line"].as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("read_section requires end_line"))? as usize;
+                tools::read_section(&self.sandbox, path, start, end)
             }
             "file_info" => {
                 let path = input["path"].as_str()

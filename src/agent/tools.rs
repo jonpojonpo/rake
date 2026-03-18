@@ -26,6 +26,44 @@ pub fn head(sandbox: &Sandbox, path: &str, n: usize) -> Result<String> {
     Ok(out)
 }
 
+// ── read_section ──────────────────────────────────────────────────────────────
+//
+// Reads a contiguous block of lines from a file (1-indexed, inclusive).
+// This is the primary navigation tool for large documents.
+// The index file (_index.md) provides start/end line numbers for each section.
+
+pub fn read_section(sandbox: &Sandbox, path: &str, start: usize, end: usize) -> Result<String> {
+    if start == 0 {
+        return Err(anyhow!("start_line is 1-indexed; use 1 for the first line"));
+    }
+    let bytes = sandbox
+        .read_file(path)
+        .ok_or_else(|| anyhow!("file not found: {path}"))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let total = text.lines().count();
+
+    let lo = start.saturating_sub(1); // convert to 0-indexed
+    let hi = end.min(total);          // clamp to file length
+
+    if lo >= total {
+        return Err(anyhow!(
+            "start_line {start} exceeds file length ({total} lines)"
+        ));
+    }
+
+    let lines: Vec<&str> = text.lines().skip(lo).take(hi.saturating_sub(lo)).collect();
+    let mut out = lines.join("\n");
+
+    let remaining = total.saturating_sub(hi);
+    if remaining > 0 {
+        out.push_str(&format!(
+            "\n\n[showing lines {start}–{end} of {total}; {} more lines below]",
+            remaining
+        ));
+    }
+    Ok(out)
+}
+
 // ── file_info ─────────────────────────────────────────────────────────────────
 
 pub fn file_info(sandbox: &Sandbox, path: &str) -> Result<String> {
@@ -71,6 +109,12 @@ fn ext_to_mime(ext: &str) -> &'static str {
         "sql"                    => "text/x-sql",
         "xml"                    => "application/xml",
         "parquet"                => "application/octet-stream",
+        "xlsx" | "xls"           => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "docx" | "doc"           => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" | "ppt"           => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "pdf"                    => "application/pdf",
+        "zip"                    => "application/zip",
+        "txt"                    => "text/plain",
         _                        => "application/octet-stream",
     }
 }
