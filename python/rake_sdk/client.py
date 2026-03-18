@@ -63,6 +63,12 @@ class RakeConfig:
     # converts DOCX/XLSX/PPTX/ZIP, extracts markdown tables as CSV)
     preprocess: bool = True
 
+    # Path to a directory of WASM skill modules to mount at /skills/ in the
+    # sandbox. Each <name>.wasm becomes callable via run_skill(name, input).
+    # Companion <name>.json files (with a "description" field) populate the
+    # auto-generated /skills/manifest.json index.
+    skills_dir: Optional[str] = None
+
     # Additional environment variables forwarded to rake process
     extra_env: dict[str, str] = field(default_factory=dict)
 
@@ -106,6 +112,7 @@ class RakeClient:
         tools: Optional[list[str]] = None,
         max_mem: Optional[int] = None,
         timeout: Optional[int] = None,
+        skills_dir: Optional[Union[str, Path]] = None,
     ) -> RakeResult:
         """
         Run rake on the given files and return a structured result.
@@ -120,12 +127,16 @@ class RakeClient:
             tools: Tool list override (e.g. ["read", "grep", "write"]).
             max_mem: Sandbox memory override (MB).
             timeout: Execution timeout override (seconds).
+            skills_dir: Path to a directory of WASM skill modules to mount at
+                /skills/ inside the sandbox. Overrides config.skills_dir.
 
         Returns:
             RakeResult with summary, findings, trajectory, and token stats.
         """
         binary = await self._resolve_binary()
         file_paths = [str(Path(f).resolve()) for f in files]
+
+        resolved_skills = skills_dir or self.config.skills_dir
 
         cmd = self._build_command(
             binary=binary,
@@ -137,6 +148,7 @@ class RakeClient:
             model=model or self.config.model,
             tools=tools or self.config.tools,
             max_mem=max_mem or self.config.max_mem,
+            skills_dir=resolved_skills,
         )
 
         env = self._build_env()
@@ -255,6 +267,7 @@ class RakeClient:
         model: Optional[str],
         tools: list[str],
         max_mem: int,
+        skills_dir: Optional[Union[str, Path]] = None,
     ) -> list[str]:
         cmd = [binary, "--llm", llm]
 
@@ -268,6 +281,9 @@ class RakeClient:
         cmd += ["--goal", goal]
         cmd += ["--tools", ",".join(tools)]
         cmd += ["--max-mem", str(max_mem)]
+
+        if skills_dir:
+            cmd += ["--skills", str(Path(skills_dir).resolve())]
 
         if system:
             cmd += ["--system", system]
