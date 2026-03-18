@@ -1,0 +1,77 @@
+version: "3.9"
+
+# Local development stack for rake microservices.
+#
+# Usage:
+#   cp python/local.settings.json.example python/local.settings.json
+#   # Edit local.settings.json with your API keys
+#   docker compose -f docker/docker-compose.yml up
+
+services:
+  # ── rake FastAPI dev server ──────────────────────────────────────────────
+  rake-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.local
+    image: rake-local:latest
+    ports:
+      - "8000:8000"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RAKE_LLM: ${RAKE_LLM:-claude}
+      RAKE_MODEL: ${RAKE_MODEL:-claude-sonnet-4-6}
+      RAKE_TIMEOUT: "240"
+      # Azurite well-known dev connection string — see .env.example for the value
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING:-UseDevelopmentStorage=true}
+    volumes:
+      - ../python/rake_sdk:/app/rake_sdk:ro
+      - ../python/services:/app/services:ro
+      - ../docker/local_server.py:/app/local_server.py:ro
+    depends_on:
+      azurite:
+        condition: service_healthy
+    restart: on-failure
+
+  # ── Azure Storage emulator (Azurite) ────────────────────────────────────
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    ports:
+      - "10000:10000"  # Blob
+      - "10001:10001"  # Queue
+      - "10002:10002"  # Table
+    command: azurite --loose --blobHost 0.0.0.0 --queueHost 0.0.0.0
+    volumes:
+      - azurite-data:/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "10000"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Azure Functions local runtime (optional) ────────────────────────────
+  rake-functions:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: rake-functions:latest
+    ports:
+      - "7071:80"
+    environment:
+      AzureWebJobsStorage: ${AZURITE_CONNECTION_STRING:-UseDevelopmentStorage=true}
+      FUNCTIONS_WORKER_RUNTIME: python
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RAKE_LLM: ${RAKE_LLM:-claude}
+      RAKE_MODEL: ${RAKE_MODEL:-claude-sonnet-4-6}
+      RAKE_TIMEOUT: "240"
+      RESULTS_CONTAINER: rake-results
+      DATA_RESULTS_CONTAINER: data-results
+    depends_on:
+      azurite:
+        condition: service_healthy
+    profiles:
+      - functions  # only start with: docker compose --profile functions up
+
+volumes:
+  azurite-data:

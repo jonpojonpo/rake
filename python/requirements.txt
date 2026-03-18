@@ -1,0 +1,13 @@
+# Azure Functions runtime
+azure-functions>=1.18.0
+
+# Azure SDK
+azure-storage-blob>=12.19.0
+azure-servicebus>=7.11.0
+azure-identity>=1.15.0
+
+# Telemetry
+applicationinsights>=0.11.10
+
+# rake Python SDK (local install — see pyproject.toml for production)
+# rake-sdk  # install from PyPI once published
