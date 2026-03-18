@@ -176,86 +176,149 @@ fn resolve_system(opt: &Option<String>) -> Result<String> {
     }
 }
 
-/// Scan `skills_dir` for `.wasm` files, mount them at `/skills/<name>.wasm`,
-/// mount any companion `.json` metadata files, and generate a
-/// `/skills/manifest.json` index so the agent can discover what's available.
-fn mount_skills(sandbox: &mut Sandbox, skills_dir: &std::path::Path) -> Result<()> {
-    use std::collections::BTreeMap;
+/// Parse the YAML frontmatter from a SKILL.md file.
+///
+/// Frontmatter is a block delimited by `---` on its own line at the very start
+/// of the file.  We extract only the `name:` and `description:` fields — no
+/// full YAML parser required.
+fn parse_skill_frontmatter(content: &str) -> (String, String) {
+    let mut name = String::new();
+    let mut description = String::new();
 
+    // Must start with "---\n" (or "---\r\n")
+    let body = if let Some(rest) = content.strip_prefix("---\n").or_else(|| content.strip_prefix("---\r\n")) {
+        rest
+    } else {
+        return (name, description);
+    };
+
+    // Find the closing "---"
+    let fm_end = body
+        .find("\n---\n")
+        .or_else(|| body.find("\n---\r\n"))
+        .or_else(|| body.find("\n---")) // end-of-file variant
+        .unwrap_or(body.len());
+
+    for line in body[..fm_end].lines() {
+        if let Some(v) = line.strip_prefix("name:") {
+            name = v.trim().trim_matches('"').trim_matches('\'').to_string();
+        } else if let Some(v) = line.strip_prefix("description:") {
+            description = v.trim().trim_matches('"').trim_matches('\'').to_string();
+        }
+    }
+
+    (name, description)
+}
+
+/// Recursively mount every file under `dir` into the sandbox at the VFS prefix
+/// `vfs_prefix/<relative-path>`.
+fn mount_dir_recursive(
+    sandbox: &mut Sandbox,
+    dir: &std::path::Path,
+    vfs_prefix: &str,
+) -> Result<usize> {
+    let mut count = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let sub = format!(
+                "{vfs_prefix}/{}",
+                path.file_name().unwrap().to_string_lossy()
+            );
+            count += mount_dir_recursive(sandbox, &path, &sub)?;
+        } else {
+            let bytes = fs::read(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let vfs_path = PathBuf::from(format!(
+                "{vfs_prefix}/{}",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            sandbox.mount(vfs_path, bytes);
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Implement the Agent Skills (agentskills.io) standard.
+///
+/// Each skill is a sub-directory of `skills_dir` containing a `SKILL.md` file
+/// with YAML frontmatter (`name`, `description`) followed by Markdown
+/// instructions.  Additional assets and scripts in the sub-directory are
+/// mounted alongside it.
+///
+/// Progressive disclosure layout inside the sandbox:
+///
+///   /skills/manifest.json          ← discovery: name + description for all skills
+///   /skills/<name>/SKILL.md        ← activation: full instructions
+///   /skills/<name>/scripts/…       ← on-demand: helper scripts / assets
+///
+/// The agent discovers skills by reading manifest.json, then calls
+/// `use_skill(name)` to load the full SKILL.md into context before following
+/// its instructions.
+fn mount_skills(sandbox: &mut Sandbox, skills_dir: &std::path::Path) -> Result<()> {
     if !skills_dir.is_dir() {
         anyhow::bail!("skills path is not a directory: {}", skills_dir.display());
     }
 
-    // skill name → description (populated from companion JSON if present)
     let mut manifest: Vec<serde_json::Value> = Vec::new();
-    // Gather metadata first so we can include it in the manifest even if the
-    // WASM file comes later in directory order.
-    let mut descriptions: BTreeMap<String, String> = BTreeMap::new();
-
-    for entry in fs::read_dir(skills_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if let Ok(raw) = fs::read_to_string(&path) {
-                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) {
-                        let desc = meta["description"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string();
-                        descriptions.insert(stem.to_string(), desc);
-                    }
-                }
-            }
-        }
-    }
-
     let mut skill_count = 0usize;
+
     for entry in fs::read_dir(skills_dir)? {
         let entry = entry?;
         let path = entry.path();
 
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
+        if !path.is_dir() {
+            continue; // top-level files are ignored; skills must be directories
+        }
+
+        let dir_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
 
-        match ext {
-            "wasm" => {
-                let bytes = fs::read(&path)
-                    .with_context(|| format!("reading skill {}", path.display()))?;
-                let vfs_path = PathBuf::from(format!("/skills/{stem}.wasm"));
-                sandbox.mount(vfs_path, bytes);
-
-                let desc = descriptions.get(&stem).cloned().unwrap_or_default();
-                manifest.push(serde_json::json!({
-                    "name": stem,
-                    "description": desc,
-                    "wasm": format!("/skills/{stem}.wasm"),
-                    "usage": format!("run_skill(name=\"{stem}\", input=\"<your input text>\")"),
-                }));
-                skill_count += 1;
-            }
-            "json" => {
-                // Mount metadata alongside the WASM for completeness.
-                let bytes = fs::read(&path)?;
-                sandbox.mount(PathBuf::from(format!("/skills/{stem}.json")), bytes);
-            }
-            // Ignore other file types (READMEs, etc.) — don't clutter the VFS.
-            _ => {}
+        let skill_md_path = path.join("SKILL.md");
+        if !skill_md_path.exists() {
+            // Not a skill directory — skip silently.
+            continue;
         }
+
+        let skill_md = fs::read_to_string(&skill_md_path)
+            .with_context(|| format!("reading {}", skill_md_path.display()))?;
+
+        let (fm_name, fm_description) = parse_skill_frontmatter(&skill_md);
+
+        // The canonical skill name is the frontmatter `name` field; fall back to
+        // the directory name if the frontmatter is missing or malformed.
+        let skill_name = if fm_name.is_empty() { dir_name.clone() } else { fm_name };
+
+        // Mount every file in the skill directory recursively.
+        let vfs_prefix = format!("/skills/{skill_name}");
+        mount_dir_recursive(sandbox, &path, &vfs_prefix)?;
+        skill_count += 1;
+
+        manifest.push(serde_json::json!({
+            "name":        skill_name,
+            "description": fm_description,
+            "skill_md":    format!("/skills/{skill_name}/SKILL.md"),
+            "usage":       format!("use_skill(name=\"{skill_name}\")"),
+        }));
     }
 
-    // Always write the manifest even if zero skills (empty list is informative).
     manifest.sort_by(|a, b| {
         a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
     });
+
     let manifest_json = serde_json::to_string_pretty(&serde_json::json!({
         "skills": manifest,
-        "count": skill_count,
-        "usage": "Call run_skill(name, input) to execute a skill. Input text is passed as /input.txt inside the skill's environment.",
+        "count":  skill_count,
+        "how_to_use": [
+            "1. Read this manifest to discover available skills.",
+            "2. Call use_skill(name) to load a skill's full instructions into context.",
+            "3. Follow the skill's instructions. Access companion scripts/assets via read_file."
+        ],
     }))?;
     sandbox.mount(
         PathBuf::from("/skills/manifest.json"),

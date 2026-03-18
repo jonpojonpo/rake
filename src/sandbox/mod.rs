@@ -101,40 +101,16 @@ impl Sandbox {
         self.scratch_cache.lock().unwrap().get(&PathBuf::from(path)).cloned()
     }
 
-    /// Execute a WASM skill mounted at `/skills/<name>.wasm`.
+    /// Load a skill's `SKILL.md` file from `/skills/<name>/SKILL.md`.
     ///
-    /// The skill runs in a child sandbox that can see all currently-mounted
-    /// files **plus** `/input.txt` containing the caller-supplied `input`.
-    /// The skill's stdout is returned as the result string.
-    pub fn run_skill(&self, name: &str, input: &str) -> Result<String> {
-        let wasm_key = PathBuf::from(format!("/skills/{name}.wasm"));
-        let wasm_bytes = self
-            .virtual_fs
-            .get(&wasm_key)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "skill '{name}' not found. Read /skills/manifest.json for available skills."
-                )
-            })?
-            .clone();
-
-        // Child VFS = parent VFS + /input.txt with the caller's input.
-        let mut child_vfs = self.virtual_fs.clone();
-        child_vfs.insert(PathBuf::from("/input.txt"), input.as_bytes().to_vec());
-
-        let output = run_wasm_with_engine(
-            &self.engine,
-            Arc::new(child_vfs),
-            Arc::new(self.config.clone()),
-            &wasm_bytes,
-        )?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        if stdout.trim().is_empty() {
-            Ok("(skill produced no output)".to_string())
-        } else {
-            Ok(stdout)
-        }
+    /// Returns the full Markdown content so the agent can read the skill's
+    /// instructions and follow them.  Returns `None` if the skill is not
+    /// mounted (caller should surface a helpful error).
+    pub fn read_skill(&self, name: &str) -> Option<String> {
+        let path = PathBuf::from(format!("/skills/{name}/SKILL.md"));
+        self.virtual_fs
+            .get(&path)
+            .and_then(|b| String::from_utf8(b.clone()).ok())
     }
 
     pub fn list_scratch(&self) -> Vec<String> {

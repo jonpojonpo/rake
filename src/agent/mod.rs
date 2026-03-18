@@ -311,26 +311,25 @@ fn agent_tools(has_skills: bool) -> Vec<ToolDef> {
 
     if has_skills {
         defs.push(ToolDef::new(
-            "run_skill",
-            "Execute an installed skill (WASM module) from /skills/. \
-             Skills provide specialised processing: custom parsers, domain-specific extractors, \
-             format converters, and more. \
-             Read /skills/manifest.json first to see available skills and their descriptions. \
-             The skill receives your input text as /input.txt and can also read all mounted files. \
-             Returns the skill's stdout.",
+            "use_skill",
+            "Load a skill's full instructions (SKILL.md) into context so you can follow them. \
+             Skills are reusable capabilities defined in the Agent Skills format (agentskills.io): \
+             each skill is a directory containing SKILL.md with YAML frontmatter and Markdown \
+             instructions, plus optional helper scripts/assets. \
+             \n\nWorkflow:\
+             \n  1. Read /skills/manifest.json to see available skills and their descriptions.\
+             \n  2. Call use_skill(name) to load the chosen skill's full SKILL.md instructions.\
+             \n  3. Follow those instructions. Use read_file for any companion scripts or assets \
+             the skill references under /skills/<name>/.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "name":  {
+                    "name": {
                         "type": "string",
-                        "description": "Skill name — the filename stem without .wasm (e.g. \"pdf_extract\")"
-                    },
-                    "input": {
-                        "type": "string",
-                        "description": "Text passed to the skill as /input.txt. Can be raw content, a file path reference, or structured instructions — depends on the skill."
+                        "description": "Skill name as listed in /skills/manifest.json (e.g. \"write-document\")"
                     }
                 },
-                "required": ["name", "input"]
+                "required": ["name"]
             }),
         ));
     }
@@ -377,8 +376,9 @@ When you have completed a thorough analysis, call `done` with a detailed Markdow
             .collect::<Vec<_>>()
             .join("\n");
         let skill_hint = if has_skills {
-            "\n\nSkills are available. Read /skills/manifest.json to see what's installed, \
-             then use run_skill(name, input) to invoke them for specialised processing."
+            "\n\nAgent Skills are mounted at /skills/. \
+             Read /skills/manifest.json to discover available skills, \
+             then call use_skill(name) to load a skill's instructions before using it."
         } else {
             ""
         };
@@ -550,12 +550,15 @@ When you have completed a thorough analysis, call `done` with a detailed Markdow
                 let pointer = input["pointer"].as_str().unwrap_or("");
                 tools::json_query(&self.sandbox, path, pointer)
             }
-            "run_skill" => {
+            "use_skill" => {
                 let name = input["name"]
                     .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("run_skill requires name"))?;
-                let skill_input = input["input"].as_str().unwrap_or("");
-                self.sandbox.run_skill(name, skill_input)
+                    .ok_or_else(|| anyhow::anyhow!("use_skill requires name"))?;
+                self.sandbox.read_skill(name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "skill '{name}' not found. Read /skills/manifest.json for available skills."
+                    )
+                })
             }
             "done" => {
                 let summary = input["summary"]
