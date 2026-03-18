@@ -1,28 +1,16 @@
 """
-Markdown document preprocessor.
+Markdown / plain-text preprocessor.
 
-For each .md / .txt file it generates a companion `<name>._index.md`
-that the LLM reads FIRST before touching the real document.
-
-The index contains:
-  - Total line count
-  - Table of contents: heading text, level, start_line, end_line
-    formatted as   # Chairman's Statement  100,235
-    so the LLM can call read_section(path, 100, 235) directly.
-  - List of extracted CSV tables: filename, line range, caption
-
-Tables inside the markdown are extracted to separate .csv files and
-listed in the index so the LLM can call csv_stats() on each one
-instead of parsing raw pipe-delimited text.
-
-Usage:
-    from rake_sdk.preprocessors.markdown import MarkdownPreprocessor
-    files = MarkdownPreprocessor().process("report.md", content_bytes)
-    # Returns {"report.md": ..., "report._index.md": ..., "report.table_001.csv": ...}
+For each .md/.txt file generates:
+  <stem>._index.md  — compact TOC with heading level, title, and line range
+                       formatted as "# Title  start,end" so the LLM can call
+                       read_section(path, start, end) without loading the whole file.
+  <stem>.table_NNN.csv — one CSV per pipe-delimited markdown table found.
 """
-
 from __future__ import annotations
 
+import csv as _csv
+import io
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,15 +19,15 @@ from typing import Optional
 
 @dataclass
 class Section:
-    level: int        # 1–6 (ATX heading level)
+    level: int
     title: str
-    start_line: int   # 1-indexed
-    end_line: int     # inclusive
+    start_line: int
+    end_line: int
 
 
 @dataclass
 class ExtractedTable:
-    name: str          # e.g. "report.table_001.csv"
+    name: str
     csv_content: str
     start_line: int
     end_line: int
@@ -47,119 +35,62 @@ class ExtractedTable:
 
 
 class MarkdownPreprocessor:
-    """
-    Preprocesses a markdown (or plain text) document into:
-    1. The original file (unchanged)
-    2. A compact _index.md with TOC and line ranges
-    3. One CSV file per markdown table found
-    """
-
-    MAX_INLINE_LINES = 500  # files shorter than this don't need an index
-
     def process(self, filename: str, content: bytes) -> dict[str, bytes]:
-        """
-        Returns a dict of {filename: bytes} ready to mount into the sandbox.
-        Always includes the original file plus generated companions.
-        """
         text = content.decode("utf-8", errors="replace")
         lines = text.splitlines()
-        total = len(lines)
-
         stem = Path(filename).stem
-        output: dict[str, bytes] = {filename: content}
 
         sections = self._extract_sections(lines)
-        tables = self._extract_tables(lines, stem)
+        tables   = self._extract_tables(lines, stem)
 
-        # Always generate an index for any markdown file
-        index_name = f"{stem}._index.md"
-        index_content = self._build_index(filename, total, sections, tables)
-        output[index_name] = index_content.encode("utf-8")
-
-        # Add extracted CSV files
+        result: dict[str, bytes] = {filename: content}
+        result[f"{stem}._index.md"] = self._build_index(filename, len(lines), sections, tables).encode()
         for tbl in tables:
-            output[tbl.name] = tbl.csv_content.encode("utf-8")
+            result[tbl.name] = tbl.csv_content.encode()
+        return result
 
-        return output
-
-    # ── Section extraction ────────────────────────────────────────────────────
+    # ── sections ─────────────────────────────────────────────────────────────
 
     def _extract_sections(self, lines: list[str]) -> list[Section]:
-        """
-        Find all ATX headings (# ## ###…) and compute their line ranges.
-        """
         total = len(lines)
         heading_re = re.compile(r"^(#{1,6})\s+(.+?)(?:\s+#+)?$")
-        raw: list[tuple[int, int, str]] = []  # (line_no 1-indexed, level, title)
-
-        for i, line in enumerate(lines, start=1):
+        raw: list[tuple[int, int, str]] = []
+        for i, line in enumerate(lines, 1):
             m = heading_re.match(line.rstrip())
             if m:
                 raw.append((i, len(m.group(1)), m.group(2).strip()))
-
-        sections: list[Section] = []
+        sections = []
         for idx, (lineno, level, title) in enumerate(raw):
-            # end_line = line before next heading (or EOF)
-            if idx + 1 < len(raw):
-                end = raw[idx + 1][0] - 1
-            else:
-                end = total
+            end = raw[idx + 1][0] - 1 if idx + 1 < len(raw) else total
             sections.append(Section(level=level, title=title, start_line=lineno, end_line=end))
-
         return sections
 
-    # ── Table extraction ──────────────────────────────────────────────────────
+    # ── tables ────────────────────────────────────────────────────────────────
 
     def _extract_tables(self, lines: list[str], stem: str) -> list[ExtractedTable]:
-        """
-        Find pipe-delimited markdown tables, extract them as CSV, and remove them
-        from context. Each table is saved as a numbered CSV file.
-        """
-        tables: list[ExtractedTable] = []
-        table_no = 0
-        i = 0
-        total = len(lines)
-
+        tables, table_no, i, total = [], 0, 0, len(lines)
         while i < total:
-            line = lines[i]
-            # A table block starts with a pipe row
-            if not self._is_pipe_row(line):
+            if not self._is_pipe_row(lines[i]):
                 i += 1
                 continue
-
-            # Collect the full table
             start = i
-            table_lines: list[str] = []
+            table_lines = []
             while i < total and self._is_pipe_row(lines[i]):
                 table_lines.append(lines[i])
                 i += 1
-            end = i - 1  # inclusive, 1-indexed = end+1
-
-            # Need at least header + separator + 1 data row
-            if len(table_lines) < 3:
+            if len(table_lines) < 3 or not self._is_sep(table_lines[1]):
                 continue
-            if not self._is_separator_row(table_lines[1]):
-                continue
-
             table_no += 1
-            name = f"{stem}.table_{table_no:03d}.csv"
-
-            # Look for a caption immediately before the table (e.g. **Caption**)
-            caption: Optional[str] = None
-            if start > 0:
-                prev = lines[start - 1].strip().strip("*_")
-                if prev and len(prev) < 120:
-                    caption = prev
-
-            csv_text = self._table_to_csv(table_lines)
+            caption = lines[start - 1].strip().strip("*_") if start > 0 else None
+            if caption and len(caption) > 120:
+                caption = None
             tables.append(ExtractedTable(
-                name=name,
-                csv_content=csv_text,
-                start_line=start + 1,  # 1-indexed
-                end_line=end + 1,
+                name=f"{stem}.table_{table_no:03d}.csv",
+                csv_content=self._to_csv(table_lines),
+                start_line=start + 1,
+                end_line=i,
                 caption=caption,
             ))
-
         return tables
 
     @staticmethod
@@ -168,73 +99,44 @@ class MarkdownPreprocessor:
         return bool(s) and s.startswith("|") and "|" in s[1:]
 
     @staticmethod
-    def _is_separator_row(line: str) -> bool:
+    def _is_sep(line: str) -> bool:
         return bool(re.match(r"^\|[\s\-:|\s]+\|$", line.strip()))
 
     @staticmethod
-    def _table_to_csv(table_lines: list[str]) -> str:
-        import csv, io
+    def _to_csv(table_lines: list[str]) -> str:
         buf = io.StringIO()
-        writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
-        for lineno, row_str in enumerate(table_lines):
-            # Skip separator row
-            if re.match(r"^\|[\s\-:|\s]+\|$", row_str.strip()):
+        w = _csv.writer(buf)
+        for row in table_lines:
+            if re.match(r"^\|[\s\-:|\s]+\|$", row.strip()):
                 continue
-            cells = [c.strip() for c in row_str.strip().strip("|").split("|")]
-            writer.writerow(cells)
+            w.writerow([c.strip() for c in row.strip().strip("|").split("|")])
         return buf.getvalue()
 
-    # ── Index generation ──────────────────────────────────────────────────────
+    # ── index ─────────────────────────────────────────────────────────────────
 
-    def _build_index(
-        self,
-        filename: str,
-        total_lines: int,
-        sections: list[Section],
-        tables: list[ExtractedTable],
-    ) -> str:
-        lines = [
+    def _build_index(self, filename: str, total: int, sections: list[Section], tables: list[ExtractedTable]) -> str:
+        out = [
             f"# Document Index: {filename}",
-            f"Total lines: {total_lines:,}",
+            f"Total lines: {total:,}",
             "",
-            "## How to navigate",
-            "Use `read_section` to read a specific section without loading the full file.",
-            "Format: `start_line,end_line` — e.g. `100,235` means lines 100 to 235.",
-            "Use `csv_stats` on extracted table files — never parse raw pipe tables.",
+            "## Navigation",
+            "Use `read_section(path, start_line, end_line)` to read a section.",
+            "Format shown below: `# Heading  start,end`",
+            "Use `csv_stats` on extracted table CSV files.",
             "",
         ]
-
         if sections:
-            lines.append("## Table of Contents")
-            lines.append("")
+            out.append("## Table of Contents")
+            out.append("")
             for s in sections:
                 indent = "  " * (s.level - 1)
-                prefix = "#" * s.level
-                # Key format the LLM sees: "# Section Title  start,end"
-                lines.append(
-                    f"{indent}{prefix} {s.title}  {s.start_line},{s.end_line}"
-                )
-            lines.append("")
-
+                out.append(f"{indent}{'#' * s.level} {s.title}  {s.start_line},{s.end_line}")
+            out.append("")
         if tables:
-            lines.append("## Extracted Tables")
-            lines.append("")
-            lines.append("These tables have been extracted to CSV files — use `csv_stats` on them.")
-            lines.append("")
-            for tbl in tables:
-                caption_note = f" — {tbl.caption}" if tbl.caption else ""
-                lines.append(
-                    f"- `{tbl.name}`  (source lines {tbl.start_line}–{tbl.end_line}{caption_note})"
-                )
-            lines.append("")
-
-        lines += [
-            "## Quick reference",
-            "```",
-            f"read_section(path='{filename}', start_line=N, end_line=M)  # read a section",
-            f"grep_files(pattern='keyword', path_filter='{filename}')     # search within doc",
-            f"csv_stats(path='<table>.csv')                               # analyse a table",
-            "```",
-        ]
-
-        return "\n".join(lines) + "\n"
+            out.append("## Extracted Tables")
+            out.append("")
+            for t in tables:
+                note = f" — {t.caption}" if t.caption else ""
+                out.append(f"- `{t.name}` (lines {t.start_line}–{t.end_line}{note})")
+            out.append("")
+        return "\n".join(out) + "\n"

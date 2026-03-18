@@ -1,60 +1,63 @@
 version: "3.9"
 
-# Local development stack for rake document/data analysis microservices.
-# Mirrors the AWS production setup using LocalStack for S3/SQS/SNS.
+# Local development stack for the rake FastAPI server.
 #
 # Usage:
-#   cp docker/.env.example docker/.env
+#   cp .env.example .env
 #   # Edit .env with your API keys
 #   docker compose -f docker/docker-compose.yml up
+#
+# API available at: http://localhost:8000
+# LocalStack S3 at: http://localhost:4566
 
 services:
-  # ── rake API server (FastAPI dev mirror of AWS Lambda endpoints) ──────────
+  # ── rake FastAPI server ──────────────────────────────────────────────────
   rake-api:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: rake-local:latest
+    image: rake-api:latest
     ports:
       - "8000:8000"
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       RAKE_LLM: ${RAKE_LLM:-claude}
-      RAKE_MODEL: ${RAKE_MODEL:-claude-sonnet-4-6}
-      RAKE_TIMEOUT: "300"
-      AWS_DEFAULT_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
+      RAKE_MODEL: ${RAKE_MODEL:-}
+      RAKE_TIMEOUT: ${RAKE_TIMEOUT:-300}
+      # S3 — point at LocalStack for local dev
+      S3_RESULTS_BUCKET: ${S3_RESULTS_BUCKET:-rake-results}
+      S3_RESULTS_PREFIX: ${S3_RESULTS_PREFIX:-rake-results/}
+      S3_PRESIGN_TTL_SECONDS: ${S3_PRESIGN_TTL_SECONDS:-3600}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
       AWS_ENDPOINT_URL: http://localstack:4566
-      UPLOAD_BUCKET: rake-uploads-local
-      RESULTS_BUCKET: rake-results-local
     volumes:
       - ../python/rake_sdk:/app/rake_sdk:ro
-      - ../python/aws/lambdas:/app/lambdas:ro
-      - ../docker/local_server.py:/app/local_server.py:ro
+      - ../python/server:/app/server:ro
     depends_on:
       localstack:
         condition: service_healthy
     restart: on-failure
 
-  # ── LocalStack (AWS emulator: S3, SQS, SNS, Lambda) ──────────────────────
+  # ── LocalStack (AWS S3 emulator) ─────────────────────────────────────────
   localstack:
-    image: localstack/localstack:latest
+    image: localstack/localstack:3
     ports:
       - "4566:4566"
     environment:
-      SERVICES: s3,sqs,sns
-      DEBUG: "0"
-      PERSISTENCE: "0"
+      SERVICES: s3
+      DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      PERSISTENCE: 1
     volumes:
       - localstack-data:/var/lib/localstack
       - ./localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 15
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
 volumes:
   localstack-data:

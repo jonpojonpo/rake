@@ -6,6 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use clap::{Parser, ValueEnum};
 use sandbox::{Sandbox, SandboxConfig, ToolSet};
 
@@ -223,7 +224,20 @@ fn main() -> Result<()> {
         eprintln!("\x1b[31m[FATAL] {e}\x1b[0m");
     }
 
-    // Emit trajectory JSON to stdout.
+    // Collect any files the LLM wrote during the run.
+    // These are the agent's output artefacts — reports, edited docs, CSVs, etc.
+    let output_files: std::collections::HashMap<String, String> = ag
+        .sandbox
+        .list_scratch()
+        .into_iter()
+        .filter_map(|name| {
+            ag.sandbox.read_scratch(&name).map(|bytes| {
+                (name, base64::encode(&bytes))
+            })
+        })
+        .collect();
+
+    // Emit trajectory + output files as a single JSON object to stdout.
     let steps: Vec<_> = ag
         .trajectory
         .0
@@ -242,6 +256,10 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    println!("{}", serde_json::to_string_pretty(&steps)?);
+    let out = serde_json::json!({
+        "trajectory": steps,
+        "output_files": output_files,
+    });
+    println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }

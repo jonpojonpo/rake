@@ -152,7 +152,22 @@ class RakeClient:
                 stderr=stderr,
             ) from exc
 
-        return RakeResult.from_trajectory(raw, files=file_paths)
+        # rake now emits {"trajectory": [...], "output_files": {"name": "<b64>"}}
+        if isinstance(raw, dict):
+            trajectory = raw.get("trajectory", [])
+            output_files_b64: dict[str, str] = raw.get("output_files", {})
+        else:
+            # Legacy: bare list
+            trajectory = raw
+            output_files_b64 = {}
+
+        import base64 as _b64
+        output_files = {
+            name: _b64.b64decode(data)
+            for name, data in output_files_b64.items()
+        }
+
+        return RakeResult.from_trajectory(trajectory, files=file_paths, output_files=output_files)
 
     async def analyze_bytes(
         self,

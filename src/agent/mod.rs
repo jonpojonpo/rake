@@ -193,11 +193,14 @@ fn agent_tools() -> Vec<ToolDef> {
         ToolDef::new(
             "write_file",
             "Write content to a file in the sandbox scratch space. \
-             Use this to save structured findings, reports, or transformed data.",
+             Use this to produce output artefacts for the user: \
+             reports (report.md), extracted tables (data.csv), edited documents, summaries. \
+             All files written here are returned as downloadable outputs alongside the summary. \
+             Prefer structured outputs (markdown, CSV, JSON) over embedding everything in the summary.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path":    { "type": "string", "description": "Destination path (e.g. report.md)" },
+                    "path":    { "type": "string", "description": "Destination path (e.g. report.md, summary.csv)" },
                     "content": { "type": "string", "description": "File content" }
                 },
                 "required": ["path", "content"]
