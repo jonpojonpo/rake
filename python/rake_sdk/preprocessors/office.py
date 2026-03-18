@@ -1,4 +1,4 @@
-"""Convert DOCX/XLSX/PPTX/PDF to text/CSV, then run through MarkdownPreprocessor."""
+"""Convert DOCX/XLSX/PPTX/PDF/ODF to text/CSV, then run through MarkdownPreprocessor."""
 from __future__ import annotations
 
 import io
@@ -12,7 +12,8 @@ def convert(filename: str, content: bytes) -> dict[str, bytes]:
     ext = Path(filename).suffix.lower()
     stem = Path(filename).stem
     fn = {".docx": _docx, ".doc": _docx, ".xlsx": _xlsx, ".xls": _xlsx,
-          ".pptx": _pptx, ".ppt": _pptx, ".pdf": _pdf}.get(ext)
+          ".pptx": _pptx, ".ppt": _pptx, ".pdf": _pdf,
+          ".odt": _odt, ".ods": _ods, ".odp": _odp}.get(ext)
     return fn(filename, stem, content) if fn else {filename: content}
 
 
@@ -57,6 +58,19 @@ def _docx(filename: str, stem: str, content: bytes) -> dict[str, bytes]:
                     csvs[name] = buf.getvalue().encode()
                     md.append(f"\n[Table {table_no} → `{name}`]\n")
                     break
+    # Inventory embedded images (note presence without extracting binary)
+    try:
+        image_rels = [
+            r.target_ref for r in doc.part.rels.values()
+            if "image" in r.reltype
+        ]
+        if image_rels:
+            md.append("\n## Embedded Images\n")
+            for img_ref in image_rels:
+                md.append(f"- `{img_ref}`")
+    except Exception:
+        pass
+
     md_name = f"{stem}.md"
     md_bytes = "\n".join(md).encode()
     result = MarkdownPreprocessor().process(md_name, md_bytes)
@@ -134,3 +148,121 @@ def _pdf(filename: str, stem: str, content: bytes) -> dict[str, bytes]:
         lines.append("")
     txt_name = f"{stem}.txt"
     return MarkdownPreprocessor().process(txt_name, "\n".join(lines).encode())
+
+
+# ── ODF (OpenDocument) formats ────────────────────────────────────────────────
+
+def _odt(filename: str, stem: str, content: bytes) -> dict[str, bytes]:
+    """OpenDocument Text (.odt) → markdown."""
+    try:
+        from odf import teletype  # type: ignore
+        from odf.opendocument import load as odf_load  # type: ignore
+        from odf.text import H, List, ListItem, P  # type: ignore
+    except ImportError:
+        return {filename: f"# {filename}\nInstall odfpy to convert.\n".encode()}
+
+    doc = odf_load(io.BytesIO(content))
+    md: list[str] = []
+
+    def _walk(node: object) -> None:
+        tag = getattr(node, "qname", ("", ""))[1]
+        if tag == "h":
+            level = int(node.getAttribute("text:outline-level") or 1)  # type: ignore[attr-defined]
+            text = teletype.extractText(node).strip()
+            if text:
+                md.append(f"{'#' * level} {text}")
+        elif tag == "list":
+            for item in node.childNodes:  # type: ignore[attr-defined]
+                item_text = teletype.extractText(item).strip()
+                if item_text:
+                    md.append(f"- {item_text}")
+        elif tag == "p":
+            text = teletype.extractText(node).strip()
+            md.append(text)  # empty string → blank line separator
+        else:
+            for child in getattr(node, "childNodes", []):
+                _walk(child)
+
+    for child in doc.text.childNodes:
+        _walk(child)
+
+    md_name = f"{stem}.md"
+    return MarkdownPreprocessor().process(md_name, "\n".join(md).encode())
+
+
+def _ods(filename: str, stem: str, content: bytes) -> dict[str, bytes]:
+    """OpenDocument Spreadsheet (.ods) → per-sheet CSVs + index."""
+    try:
+        from odf import teletype  # type: ignore
+        from odf.opendocument import load as odf_load  # type: ignore
+        from odf.table import Table, TableCell, TableRow  # type: ignore
+    except ImportError:
+        return {filename: f"# {filename}\nInstall odfpy to convert.\n".encode()}
+
+    import csv as _csv
+
+    doc = odf_load(io.BytesIO(content))
+    result: dict[str, bytes] = {}
+    sheet_info: list[tuple[str, str]] = []
+
+    for sheet in doc.spreadsheet.getElementsByType(Table):
+        name = sheet.getAttribute("table:name") or "Sheet"
+        safe = re.sub(r"[^\w\-]", "_", name)
+        csv_name = f"{stem}.{safe}.csv"
+        buf = io.StringIO()
+        w = _csv.writer(buf)
+        for row in sheet.getElementsByType(TableRow):
+            cells: list[str] = []
+            for cell in row.getElementsByType(TableCell):
+                repeat = int(cell.getAttribute("table:number-columns-repeated") or 1)
+                val = teletype.extractText(cell).strip()
+                cells.extend([val] * min(repeat, 256))  # cap repeat to avoid giant sparse sheets
+            # Trim trailing empty cells
+            while cells and not cells[-1]:
+                cells.pop()
+            if cells:
+                w.writerow(cells)
+        csv_content = buf.getvalue()
+        if csv_content.strip():
+            result[csv_name] = csv_content.encode()
+            sheet_info.append((name, csv_name))
+
+    idx = [f"# Spreadsheet: {filename}", f"Sheets: {len(sheet_info)}", "",
+           "Use `csv_stats` on each sheet. Do NOT use `read_file` on CSVs.", ""]
+    for sh, cn in sheet_info:
+        idx.append(f"- **{sh}** → `{cn}`")
+    result[f"{stem}._index.md"] = "\n".join(idx).encode()
+    return result
+
+
+def _odp(filename: str, stem: str, content: bytes) -> dict[str, bytes]:
+    """OpenDocument Presentation (.odp) → markdown."""
+    try:
+        from odf import teletype  # type: ignore
+        from odf.draw import Page  # type: ignore
+        from odf.opendocument import load as odf_load  # type: ignore
+        from odf.text import P  # type: ignore
+    except ImportError:
+        return {filename: f"# {filename}\nInstall odfpy to convert.\n".encode()}
+
+    doc = odf_load(io.BytesIO(content))
+    md: list[str] = []
+
+    for no, slide in enumerate(doc.presentation.getElementsByType(Page), 1):
+        md.append(f"## Slide {no}")
+        for shape in slide.childNodes:
+            cls = getattr(shape, "getAttribute", lambda _: None)("presentation:class") or ""
+            text = teletype.extractText(shape).strip()
+            if not text:
+                continue
+            if "title" in cls:
+                md.append(f"**{text}**")
+            else:
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line:
+                        md.append(f"- {line}")
+        md.append("")
+
+    md_name = f"{stem}.md"
+    return MarkdownPreprocessor().process(md_name, "\n".join(md).encode())

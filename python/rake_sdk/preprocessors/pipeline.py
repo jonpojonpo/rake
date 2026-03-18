@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 _MARKDOWN_EXTS = {".md", ".markdown", ".txt", ".rst"}
-_OFFICE_EXTS   = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf"}
+_OFFICE_EXTS   = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf",
+                  ".odt", ".ods", ".odp"}
 _ARCHIVE_EXTS  = {".zip"}
 
 
