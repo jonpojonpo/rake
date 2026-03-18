@@ -7,6 +7,8 @@ Supports:
   - Custom system prompts
   - Configurable tool sets and memory limits
   - Structured result parsing with finding extraction
+  - Document preprocessing: auto-generates _index.md files with line ranges,
+    extracts markdown tables as CSVs, converts DOCX/XLSX/PPTX/PDF/ZIP
 """
 
 from __future__ import annotations
@@ -56,6 +58,10 @@ class RakeConfig:
 
     # Max time (seconds) to wait for rake to finish
     timeout: int = 300
+
+    # Automatically preprocess documents before mounting (generates index files,
+    # converts DOCX/XLSX/PPTX/ZIP, extracts markdown tables as CSV)
+    preprocess: bool = True
 
     # Additional environment variables forwarded to rake process
     extra_env: dict[str, str] = field(default_factory=dict)
@@ -146,26 +152,53 @@ class RakeClient:
                 stderr=stderr,
             ) from exc
 
-        return RakeResult.from_trajectory(raw, files=file_paths)
+        # rake now emits {"trajectory": [...], "output_files": {"name": "<b64>"}}
+        if isinstance(raw, dict):
+            trajectory = raw.get("trajectory", [])
+            output_files_b64: dict[str, str] = raw.get("output_files", {})
+        else:
+            # Legacy: bare list
+            trajectory = raw
+            output_files_b64 = {}
+
+        import base64 as _b64
+        output_files = {
+            name: _b64.b64decode(data)
+            for name, data in output_files_b64.items()
+        }
+
+        return RakeResult.from_trajectory(trajectory, files=file_paths, output_files=output_files)
 
     async def analyze_bytes(
         self,
         named_files: dict[str, bytes],
         *,
         goal: str = "Analyse these files thoroughly.",
+        preprocess: Optional[bool] = None,
         **kwargs,
     ) -> RakeResult:
         """
         Analyse in-memory file content without requiring files on disk.
 
+        Automatically preprocesses documents before mounting:
+        - Generates _index.md with section TOC and line ranges
+        - Extracts markdown tables as .csv files
+        - Converts DOCX/XLSX/PPTX/PDF/ZIP to text equivalents
+
         Args:
             named_files: Mapping of filename → file bytes.
             goal: Analysis goal.
+            preprocess: Override config.preprocess for this call.
             **kwargs: Forwarded to `analyze()`.
 
         Returns:
             RakeResult
         """
+        should_preprocess = preprocess if preprocess is not None else self.config.preprocess
+        if should_preprocess:
+            from .preprocessors import preprocess_files
+            named_files = preprocess_files(named_files)
+
         with tempfile.TemporaryDirectory(prefix="rake_") as tmpdir:
             paths: list[Path] = []
             for name, content in named_files.items():

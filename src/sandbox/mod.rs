@@ -97,12 +97,10 @@ impl Sandbox {
             .insert(PathBuf::from(path), bytes);
     }
 
-    #[allow(dead_code)]
     pub fn read_scratch(&self, path: &str) -> Option<Vec<u8>> {
         self.scratch_cache.lock().unwrap().get(&PathBuf::from(path)).cloned()
     }
 
-    #[allow(dead_code)]
     pub fn list_scratch(&self) -> Vec<String> {
         let mut files: Vec<String> = self
             .scratch_cache

@@ -26,6 +26,44 @@ pub fn head(sandbox: &Sandbox, path: &str, n: usize) -> Result<String> {
     Ok(out)
 }
 
+// ── read_section ──────────────────────────────────────────────────────────────
+//
+// Reads a contiguous block of lines from a file (1-indexed, inclusive).
+// This is the primary navigation tool for large documents.
+// The index file (_index.md) provides start/end line numbers for each section.
+
+pub fn read_section(sandbox: &Sandbox, path: &str, start: usize, end: usize) -> Result<String> {
+    if start == 0 {
+        return Err(anyhow!("start_line is 1-indexed; use 1 for the first line"));
+    }
+    let bytes = sandbox
+        .read_file(path)
+        .ok_or_else(|| anyhow!("file not found: {path}"))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let total = text.lines().count();
+
+    let lo = start.saturating_sub(1); // convert to 0-indexed
+    let hi = end.min(total);          // clamp to file length
+
+    if lo >= total {
+        return Err(anyhow!(
+            "start_line {start} exceeds file length ({total} lines)"
+        ));
+    }
+
+    let lines: Vec<&str> = text.lines().skip(lo).take(hi.saturating_sub(lo)).collect();
+    let mut out = lines.join("\n");
+
+    let remaining = total.saturating_sub(hi);
+    if remaining > 0 {
+        out.push_str(&format!(
+            "\n\n[showing lines {start}–{end} of {total}; {} more lines below]",
+            remaining
+        ));
+    }
+    Ok(out)
+}
+
 // ── file_info ─────────────────────────────────────────────────────────────────
 
 pub fn file_info(sandbox: &Sandbox, path: &str) -> Result<String> {
@@ -71,6 +109,12 @@ fn ext_to_mime(ext: &str) -> &'static str {
         "sql"                    => "text/x-sql",
         "xml"                    => "application/xml",
         "parquet"                => "application/octet-stream",
+        "xlsx" | "xls"           => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "docx" | "doc"           => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" | "ppt"           => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "pdf"                    => "application/pdf",
+        "zip"                    => "application/zip",
+        "txt"                    => "text/plain",
         _                        => "application/octet-stream",
     }
 }
@@ -130,19 +174,56 @@ pub fn csv_stats(sandbox: &Sandbox, path: &str, sample_rows: usize) -> Result<St
                 "mean": round2(mean),
             })
         } else {
-            // Categorical column — unique values (up to 20).
-            let mut uniq: Vec<&str> = values.clone();
-            uniq.sort_unstable();
-            uniq.dedup();
-            let n_uniq = uniq.len();
-            let show: Vec<&str> = uniq.into_iter().take(20).collect();
-            json!({
-                "name": &headers[col_idx],
-                "type": "categorical",
-                "non_empty": non_empty,
-                "unique_count": n_uniq,
-                "unique_values": show,
-            })
+            // Determine if this is free-form text or a low-cardinality categorical.
+            let total_chars: usize = values.iter().map(|v| v.len()).sum();
+            let avg_len = if non_empty > 0 { total_chars / non_empty } else { 0 };
+
+            if avg_len > 50 {
+                // Free-form text column — show length stats and longest samples.
+                let mut by_len: Vec<&str> = values
+                    .iter()
+                    .filter(|&&v| !v.is_empty())
+                    .cloned()
+                    .collect();
+                by_len.sort_by_key(|v| std::cmp::Reverse(v.len()));
+                let samples: Vec<String> = by_len
+                    .iter()
+                    .take(3)
+                    .map(|s| {
+                        if s.len() > 120 {
+                            format!("{}…", &s[..120])
+                        } else {
+                            s.to_string()
+                        }
+                    })
+                    .collect();
+                json!({
+                    "name": &headers[col_idx],
+                    "type": "text",
+                    "non_empty": non_empty,
+                    "avg_len": avg_len,
+                    "max_len": by_len.first().map(|s| s.len()).unwrap_or(0),
+                    "longest_samples": samples,
+                })
+            } else {
+                // Categorical column — unique values (up to 20, truncated to 60 chars each).
+                let mut uniq: Vec<&str> = values.clone();
+                uniq.sort_unstable();
+                uniq.dedup();
+                let n_uniq = uniq.len();
+                let show: Vec<String> = uniq
+                    .into_iter()
+                    .take(20)
+                    .map(|v| if v.len() > 60 { format!("{}…", &v[..60]) } else { v.to_string() })
+                    .collect();
+                json!({
+                    "name": &headers[col_idx],
+                    "type": "categorical",
+                    "non_empty": non_empty,
+                    "unique_count": n_uniq,
+                    "unique_values": show,
+                })
+            }
         };
         col_stats.push(stat);
     }
@@ -173,6 +254,59 @@ pub fn csv_stats(sandbox: &Sandbox, path: &str, sample_rows: usize) -> Result<St
 
 fn round2(f: f64) -> f64 {
     (f * 100.0).round() / 100.0
+}
+
+// ── csv_rows ──────────────────────────────────────────────────────────────────
+//
+// Returns a slice of rows as JSON objects, streaming past skipped rows so only
+// the requested window is held in memory. Use csv_stats first to learn the
+// total row count, then iterate with csv_rows for sliding-window analysis of
+// large text-heavy CSVs.
+
+pub fn csv_rows(sandbox: &Sandbox, path: &str, start_row: usize, end_row: usize) -> Result<String> {
+    if end_row <= start_row {
+        return Err(anyhow!("end_row ({end_row}) must be greater than start_row ({start_row})"));
+    }
+
+    let bytes = sandbox
+        .read_file(path)
+        .ok_or_else(|| anyhow!("file not found: {path}"))?;
+
+    let mut rdr = csv::Reader::from_reader(bytes.as_slice());
+    let headers: Vec<String> = rdr
+        .headers()
+        .map_err(|e| anyhow!("CSV parse error: {e}"))?
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut rows: Vec<Value> = Vec::new();
+    let mut row_idx = 0usize;
+
+    for result in rdr.records() {
+        if row_idx >= end_row {
+            break;
+        }
+        let record = result.map_err(|e| anyhow!("CSV row error: {e}"))?;
+        if row_idx >= start_row {
+            let mut obj = serde_json::Map::new();
+            for (i, val) in record.iter().enumerate() {
+                if let Some(col) = headers.get(i) {
+                    obj.insert(col.clone(), json!(val));
+                }
+            }
+            rows.push(Value::Object(obj));
+        }
+        row_idx += 1;
+    }
+
+    Ok(serde_json::to_string_pretty(&json!({
+        "path": path,
+        "start_row": start_row,
+        "end_row": start_row + rows.len(),
+        "returned": rows.len(),
+        "rows": rows,
+    }))?)
 }
 
 // ── json_query ────────────────────────────────────────────────────────────────

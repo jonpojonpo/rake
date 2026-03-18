@@ -1,77 +1,63 @@
 version: "3.9"
 
-# Local development stack for rake microservices.
+# Local development stack for the rake FastAPI server.
 #
 # Usage:
-#   cp python/local.settings.json.example python/local.settings.json
-#   # Edit local.settings.json with your API keys
+#   cp .env.example .env
+#   # Edit .env with your API keys
 #   docker compose -f docker/docker-compose.yml up
+#
+# API available at: http://localhost:8000
+# LocalStack S3 at: http://localhost:4566
 
 services:
-  # ── rake FastAPI dev server ──────────────────────────────────────────────
+  # ── rake FastAPI server ──────────────────────────────────────────────────
   rake-api:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.local
-    image: rake-local:latest
+      dockerfile: docker/Dockerfile
+    image: rake-api:latest
     ports:
       - "8000:8000"
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       RAKE_LLM: ${RAKE_LLM:-claude}
-      RAKE_MODEL: ${RAKE_MODEL:-claude-sonnet-4-6}
-      RAKE_TIMEOUT: "240"
-      # Azurite well-known dev connection string — see .env.example for the value
-      AZURE_STORAGE_CONNECTION_STRING: ${AZURITE_CONNECTION_STRING:-UseDevelopmentStorage=true}
+      RAKE_MODEL: ${RAKE_MODEL:-}
+      RAKE_TIMEOUT: ${RAKE_TIMEOUT:-300}
+      # S3 — point at LocalStack for local dev
+      S3_RESULTS_BUCKET: ${S3_RESULTS_BUCKET:-rake-results}
+      S3_RESULTS_PREFIX: ${S3_RESULTS_PREFIX:-rake-results/}
+      S3_PRESIGN_TTL_SECONDS: ${S3_PRESIGN_TTL_SECONDS:-3600}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      AWS_ENDPOINT_URL: http://localstack:4566
     volumes:
       - ../python/rake_sdk:/app/rake_sdk:ro
-      - ../python/services:/app/services:ro
-      - ../docker/local_server.py:/app/local_server.py:ro
+      - ../python/server:/app/server:ro
     depends_on:
-      azurite:
+      localstack:
         condition: service_healthy
     restart: on-failure
 
-  # ── Azure Storage emulator (Azurite) ────────────────────────────────────
-  azurite:
-    image: mcr.microsoft.com/azure-storage/azurite:latest
+  # ── LocalStack (AWS S3 emulator) ─────────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3
     ports:
-      - "10000:10000"  # Blob
-      - "10001:10001"  # Queue
-      - "10002:10002"  # Table
-    command: azurite --loose --blobHost 0.0.0.0 --queueHost 0.0.0.0
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      PERSISTENCE: 1
     volumes:
-      - azurite-data:/data
+      - localstack-data:/var/lib/localstack
+      - ./localstack-init.sh:/etc/localstack/init/ready.d/init.sh:ro
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "10000"]
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
       interval: 5s
       timeout: 3s
-      retries: 10
-
-  # ── Azure Functions local runtime (optional) ────────────────────────────
-  rake-functions:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: rake-functions:latest
-    ports:
-      - "7071:80"
-    environment:
-      AzureWebJobsStorage: ${AZURITE_CONNECTION_STRING:-UseDevelopmentStorage=true}
-      FUNCTIONS_WORKER_RUNTIME: python
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      RAKE_LLM: ${RAKE_LLM:-claude}
-      RAKE_MODEL: ${RAKE_MODEL:-claude-sonnet-4-6}
-      RAKE_TIMEOUT: "240"
-      RESULTS_CONTAINER: rake-results
-      DATA_RESULTS_CONTAINER: data-results
-    depends_on:
-      azurite:
-        condition: service_healthy
-    profiles:
-      - functions  # only start with: docker compose --profile functions up
+      retries: 20
 
 volumes:
-  azurite-data:
+  localstack-data:

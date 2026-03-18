@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
+import base64 as _b64
 
 
 # ── Trajectory step models ──────────────────────────────────────────────────
@@ -198,9 +199,17 @@ class RakeResult:
     total_llm_ms: int = 0
     tool_calls: int = 0
     files_analyzed: list[str] = field(default_factory=list)
+    # Files written by the LLM during analysis (reports, CSVs, edited docs, etc.)
+    # Keys are filenames, values are raw bytes ready for upload/download.
+    output_files: dict[str, bytes] = field(default_factory=dict)
 
     @classmethod
-    def from_trajectory(cls, raw: list[dict], files: list[str]) -> "RakeResult":
+    def from_trajectory(
+        cls,
+        raw: list[dict],
+        files: list[str],
+        output_files: Optional[dict[str, bytes]] = None,
+    ) -> "RakeResult":
         steps = parse_trajectory(raw)
 
         summary = ""
@@ -227,6 +236,7 @@ class RakeResult:
             total_llm_ms=total_ms,
             tool_calls=n_tools,
             files_analyzed=files,
+            output_files=output_files or {},
         )
 
     @property
@@ -245,6 +255,10 @@ class RakeResult:
         return {
             "summary": self.summary,
             "findings": [f.to_dict() for f in self.findings],
+            "output_files": {
+                name: _b64.b64encode(data).decode("ascii")
+                for name, data in self.output_files.items()
+            },
             "stats": {
                 "total_input_tokens": self.total_input_tokens,
                 "total_output_tokens": self.total_output_tokens,

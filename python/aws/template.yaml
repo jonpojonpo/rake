@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+# rake AWS Serverless Application
+# ────────────────────────────────
+# Deploys rake document & data analysis as AWS Lambda functions.
+#
+# Infrastructure:
+#   S3: upload bucket (triggers analysis) + results bucket
+#   SQS: async job queues for each service type
+#   SNS: findings alerts topic
+#   API Gateway: synchronous HTTP endpoints
+#   Lambda: doc-analysis + data-analysis functions
+#   Lambda Layer: rake binary + Python SDK
+#
+# Deploy:
+#   sam build && sam deploy --guided
+#
+# Or with a Makefile:
+#   make deploy STACK_NAME=rake-prod BUCKET=my-deploy-bucket
+
+Description: "rake — secure LLM document & data analysis on AWS"
+
+Parameters:
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Description: "Anthropic API key (stored in SSM Parameter Store)"
+
+  RakeLLM:
+    Type: String
+    Default: claude
+    AllowedValues: [claude, openai, ollama, noop]
+
+  RakeModel:
+    Type: String
+    Default: claude-sonnet-4-6
+
+  RakeTimeout:
+    Type: Number
+    Default: 300
+    Description: "Rake subprocess timeout in seconds"
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 360       # Lambda timeout > rake timeout to avoid hard kill
+    MemorySize: 512
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+        RAKE_LLM: !Ref RakeLLM
+        RAKE_MODEL: !Ref RakeModel
+        RAKE_TIMEOUT: !Ref RakeTimeout
+        RAKE_BINARY: /opt/rake
+        UPLOAD_BUCKET: !Ref UploadBucket
+        RESULTS_BUCKET: !Ref ResultsBucket
+        RESULTS_PREFIX: rake-results/
+        FINDINGS_TOPIC_ARN: !Ref FindingsTopic
+    Layers:
+      - !Ref RakeLayer
+
+# ── S3 Buckets ────────────────────────────────────────────────────────────────
+
+Resources:
+
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "rake-uploads-${AWS::AccountId}-${Environment}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteUploadsAfter7Days
+            Status: Enabled
+            ExpirationInDays: 7
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt DocAnalysisQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "docs/"
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt DataAnalysisQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "data/"
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "rake-results-${AWS::AccountId}-${Environment}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+
+# ── SQS Queues ────────────────────────────────────────────────────────────────
+
+  DocAnalysisQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "rake-doc-analysis-${Environment}"
+      VisibilityTimeout: 400   # > Lambda timeout
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DocAnalysisDLQ.Arn
+        maxReceiveCount: 3
+
+  DocAnalysisDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "rake-doc-analysis-dlq-${Environment}"
+      MessageRetentionPeriod: 604800  # 7 days
+
+  DataAnalysisQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "rake-data-analysis-${Environment}"
+      VisibilityTimeout: 400
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DataAnalysisDLQ.Arn
+        maxReceiveCount: 3
+
+  DataAnalysisDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "rake-data-analysis-dlq-${Environment}"
+      MessageRetentionPeriod: 604800
+
+  # Allow S3 to send to SQS
+  DocAnalysisQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref DocAnalysisQueue, !Ref DataAnalysisQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: "*"
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::rake-uploads-${AWS::AccountId}-${Environment}"
+
+# ── SNS Topic ─────────────────────────────────────────────────────────────────
+
+  FindingsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "rake-findings-${Environment}"
+      DisplayName: "rake analysis findings"
+
+# ── Lambda Layer (rake binary + Python SDK) ───────────────────────────────────
+
+  RakeLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "rake-runtime-${Environment}"
+      Description: "rake binary (Rust) + Python SDK"
+      ContentUri: layers/rake-runtime/
+      CompatibleRuntimes: [python3.11]
+      CompatibleArchitectures: [arm64]
+    Metadata:
+      BuildMethod: makefile
+
+# ── Lambda: Document Analysis ─────────────────────────────────────────────────
+
+  DocAnalysisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "rake-doc-analysis-${Environment}"
+      CodeUri: lambdas/
+      Handler: doc_analysis.handler
+      Description: "rake document analysis — markdown, DOCX, XLSX, PPTX, PDF, ZIP"
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DocAnalysisQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+        HttpApi:
+          Type: HttpApi
+          Properties:
+            Path: /doc-analysis
+            Method: POST
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref UploadBucket
+        - S3WritePolicy:
+            BucketName: !Ref ResultsBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt FindingsTopic.TopicName
+        - SQSPollerPolicy:
+            QueueName: !GetAtt DocAnalysisQueue.QueueName
+
+# ── Lambda: Data Analysis ──────────────────────────────────────────────────────
+
+  DataAnalysisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "rake-data-analysis-${Environment}"
+      CodeUri: lambdas/
+      Handler: doc_analysis.handler   # same handler, different S3 prefix routes it
+      Description: "rake data analysis — CSV, JSON, JSONL profiling"
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DataAnalysisQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+        HttpApi:
+          Type: HttpApi
+          Properties:
+            Path: /data-analysis
+            Method: POST
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref UploadBucket
+        - S3WritePolicy:
+            BucketName: !Ref ResultsBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt FindingsTopic.TopicName
+        - SQSPollerPolicy:
+            QueueName: !GetAtt DataAnalysisQueue.QueueName
+      Environment:
+        Variables:
+          # Override goal for pure data profiling
+          RAKE_DEFAULT_GOAL: |
+            Profile these data files. For each file report:
+            - Schema: column names, types, sample values
+            - Shape: row/column count
+            - Quality: null rates, duplicates, anomalies
+            - Statistics: min/max/mean/p95 for numeric columns
+            - Top values for categorical columns
+            Check _index.md files first, use csv_stats() on all CSVs.
+
+# ── API Gateway outputs ───────────────────────────────────────────────────────
+
+  ServerlessHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [POST, OPTIONS]
+        AllowHeaders: [Content-Type, X-Api-Key]
+
+Outputs:
+  DocAnalysisApiUrl:
+    Description: "Document analysis API endpoint"
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/doc-analysis"
+
+  DataAnalysisApiUrl:
+    Description: "Data analysis API endpoint"
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/data-analysis"
+
+  UploadBucketName:
+    Description: "Upload bucket — drop docs/ or data/ files here to trigger analysis"
+    Value: !Ref UploadBucket
+
+  ResultsBucketName:
+    Description: "Results bucket"
+    Value: !Ref ResultsBucket
+
+  FindingsTopicArn:
+    Description: "SNS topic for analysis findings"
+    Value: !Ref FindingsTopic
+
+  DocAnalysisQueueUrl:
+    Description: "SQS queue for async document analysis jobs"
+    Value: !Ref DocAnalysisQueue

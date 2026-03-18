@@ -193,11 +193,14 @@ fn agent_tools() -> Vec<ToolDef> {
         ToolDef::new(
             "write_file",
             "Write content to a file in the sandbox scratch space. \
-             Use this to save structured findings, reports, or transformed data.",
+             Use this to produce output artefacts for the user: \
+             reports (report.md), extracted tables (data.csv), edited documents, summaries. \
+             All files written here are returned as downloadable outputs alongside the summary. \
+             Prefer structured outputs (markdown, CSV, JSON) over embedding everything in the summary.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path":    { "type": "string", "description": "Destination path (e.g. report.md)" },
+                    "path":    { "type": "string", "description": "Destination path (e.g. report.md, summary.csv)" },
                     "content": { "type": "string", "description": "File content" }
                 },
                 "required": ["path", "content"]
@@ -216,6 +219,24 @@ fn agent_tools() -> Vec<ToolDef> {
             }),
         ),
         ToolDef::new(
+            "read_section",
+            "Read a specific line range from a file (1-indexed, inclusive). \
+             ALWAYS prefer this over read_file for large documents. \
+             Check the _index.md file first to find section line ranges, \
+             then call read_section to fetch only the section you need. \
+             Example: read_section(path='report.md', start_line=100, end_line=235) \
+             reads only the Chairman's Statement without loading the full document.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path":       { "type": "string", "description": "File path" },
+                    "start_line": { "type": "integer", "description": "First line to read (1-indexed)" },
+                    "end_line":   { "type": "integer", "description": "Last line to read (inclusive)" }
+                },
+                "required": ["path", "start_line", "end_line"]
+            }),
+        ),
+        ToolDef::new(
             "file_info",
             "Return metadata about a file: size, line count, extension, mime type.",
             serde_json::json!({
@@ -228,9 +249,13 @@ fn agent_tools() -> Vec<ToolDef> {
         ),
         ToolDef::new(
             "csv_stats",
-            "Parse a CSV file and return: column names, types, unique values, \
-             numeric min/max/mean/sum, row count, and a sample of rows. \
-             Always call this first when analysing CSV files — do NOT use read_file on CSVs.",
+            "Parse a CSV file and return: column names, types (numeric/categorical/text), \
+             stats, row count, and a sample of rows. \
+             Numeric columns → min/max/mean/sum. \
+             Categorical columns (short values) → unique value list. \
+             Text columns (avg value length > 50 chars) → avg/max length and longest samples. \
+             Always call this first when analysing CSV files — do NOT use read_file on CSVs. \
+             For large text-heavy CSVs use csv_rows for sliding-window analysis after this.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -238,6 +263,23 @@ fn agent_tools() -> Vec<ToolDef> {
                     "sample_rows": { "type": "integer", "description": "Sample rows to include (default 5)" }
                 },
                 "required": ["path"]
+            }),
+        ),
+        ToolDef::new(
+            "csv_rows",
+            "Read a row range from a CSV file as JSON objects — the sliding-window tool \
+             for large or text-heavy CSVs. \
+             Call csv_stats first to learn row_count and column types, \
+             then iterate: csv_rows(path, 0, 100), csv_rows(path, 100, 200), etc. \
+             Rows are 0-indexed (first data row is 0, headers excluded).",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path":      { "type": "string" },
+                    "start_row": { "type": "integer", "description": "First row to return (0-indexed, inclusive)" },
+                    "end_row":   { "type": "integer", "description": "Last row (exclusive) — returns rows [start_row, end_row)" }
+                },
+                "required": ["path", "start_row", "end_row"]
             }),
         ),
         ToolDef::new(
@@ -438,6 +480,15 @@ When you have completed a thorough analysis, call `done` with a detailed Markdow
                 let n = input["lines"].as_u64().unwrap_or(30) as usize;
                 tools::head(&self.sandbox, path, n)
             }
+            "read_section" => {
+                let path = input["path"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("read_section requires path"))?;
+                let start = input["start_line"].as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("read_section requires start_line"))? as usize;
+                let end = input["end_line"].as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("read_section requires end_line"))? as usize;
+                tools::read_section(&self.sandbox, path, start, end)
+            }
             "file_info" => {
                 let path = input["path"].as_str()
                     .ok_or_else(|| anyhow::anyhow!("file_info requires path"))?;
@@ -448,6 +499,15 @@ When you have completed a thorough analysis, call `done` with a detailed Markdow
                     .ok_or_else(|| anyhow::anyhow!("csv_stats requires path"))?;
                 let sample = input["sample_rows"].as_u64().unwrap_or(5) as usize;
                 tools::csv_stats(&self.sandbox, path, sample)
+            }
+            "csv_rows" => {
+                let path = input["path"].as_str()
+                    .ok_or_else(|| anyhow::anyhow!("csv_rows requires path"))?;
+                let start = input["start_row"].as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("csv_rows requires start_row"))? as usize;
+                let end = input["end_row"].as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("csv_rows requires end_row"))? as usize;
+                tools::csv_rows(&self.sandbox, path, start, end)
             }
             "json_query" => {
                 let path = input["path"].as_str()
