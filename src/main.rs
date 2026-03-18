@@ -69,6 +69,13 @@ struct Cli {
     #[arg(long, default_value = "read,grep")]
     tools: String,
 
+    /// Directory of WASM skill modules to mount at /skills/ inside the sandbox.
+    /// Each <name>.wasm becomes callable via run_skill(name, input).
+    /// Companion <name>.json files (with a "description" field) are used to
+    /// build /skills/manifest.json so the agent knows what skills are available.
+    #[arg(long)]
+    skills: Option<PathBuf>,
+
     /// Files to mount into the sandbox
     #[arg(required = true)]
     files: Vec<PathBuf>,
@@ -169,6 +176,96 @@ fn resolve_system(opt: &Option<String>) -> Result<String> {
     }
 }
 
+/// Scan `skills_dir` for `.wasm` files, mount them at `/skills/<name>.wasm`,
+/// mount any companion `.json` metadata files, and generate a
+/// `/skills/manifest.json` index so the agent can discover what's available.
+fn mount_skills(sandbox: &mut Sandbox, skills_dir: &std::path::Path) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    if !skills_dir.is_dir() {
+        anyhow::bail!("skills path is not a directory: {}", skills_dir.display());
+    }
+
+    // skill name → description (populated from companion JSON if present)
+    let mut manifest: Vec<serde_json::Value> = Vec::new();
+    // Gather metadata first so we can include it in the manifest even if the
+    // WASM file comes later in directory order.
+    let mut descriptions: BTreeMap<String, String> = BTreeMap::new();
+
+    for entry in fs::read_dir(skills_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if let Ok(raw) = fs::read_to_string(&path) {
+                    if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) {
+                        let desc = meta["description"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        descriptions.insert(stem.to_string(), desc);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut skill_count = 0usize;
+    for entry in fs::read_dir(skills_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        match ext {
+            "wasm" => {
+                let bytes = fs::read(&path)
+                    .with_context(|| format!("reading skill {}", path.display()))?;
+                let vfs_path = PathBuf::from(format!("/skills/{stem}.wasm"));
+                sandbox.mount(vfs_path, bytes);
+
+                let desc = descriptions.get(&stem).cloned().unwrap_or_default();
+                manifest.push(serde_json::json!({
+                    "name": stem,
+                    "description": desc,
+                    "wasm": format!("/skills/{stem}.wasm"),
+                    "usage": format!("run_skill(name=\"{stem}\", input=\"<your input text>\")"),
+                }));
+                skill_count += 1;
+            }
+            "json" => {
+                // Mount metadata alongside the WASM for completeness.
+                let bytes = fs::read(&path)?;
+                sandbox.mount(PathBuf::from(format!("/skills/{stem}.json")), bytes);
+            }
+            // Ignore other file types (READMEs, etc.) — don't clutter the VFS.
+            _ => {}
+        }
+    }
+
+    // Always write the manifest even if zero skills (empty list is informative).
+    manifest.sort_by(|a, b| {
+        a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+    });
+    let manifest_json = serde_json::to_string_pretty(&serde_json::json!({
+        "skills": manifest,
+        "count": skill_count,
+        "usage": "Call run_skill(name, input) to execute a skill. Input text is passed as /input.txt inside the skill's environment.",
+    }))?;
+    sandbox.mount(
+        PathBuf::from("/skills/manifest.json"),
+        manifest_json.into_bytes(),
+    );
+
+    eprintln!("[skills] mounted {skill_count} skill(s) from {}", skills_dir.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -182,6 +279,12 @@ fn main() -> Result<()> {
         let bytes = fs::read(path)
             .with_context(|| format!("reading {}", path.display()))?;
         sandbox.mount(path.clone(), bytes);
+    }
+
+    // ── Mount skills directory at /skills/ ───────────────────────────────────
+    if let Some(skills_dir) = &cli.skills {
+        mount_skills(&mut sandbox, skills_dir)
+            .with_context(|| format!("mounting skills from {}", skills_dir.display()))?;
     }
 
     // ── WASM mode: skip LLM loop, run agent binary directly ──────────────────

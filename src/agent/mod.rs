@@ -160,8 +160,8 @@ fn short_val(v: &Value) -> String {
 
 // ── Tool definitions exposed to the LLM ──────────────────────────────────────
 
-fn agent_tools() -> Vec<ToolDef> {
-    vec![
+fn agent_tools(has_skills: bool) -> Vec<ToolDef> {
+    let mut defs = vec![
         ToolDef::new(
             "list_files",
             "List all files available in the sandbox.",
@@ -286,7 +286,35 @@ fn agent_tools() -> Vec<ToolDef> {
                 "required": ["summary"]
             }),
         ),
-    ]
+    ];
+
+    if has_skills {
+        defs.push(ToolDef::new(
+            "run_skill",
+            "Execute an installed skill (WASM module) from /skills/. \
+             Skills provide specialised processing: custom parsers, domain-specific extractors, \
+             format converters, and more. \
+             Read /skills/manifest.json first to see available skills and their descriptions. \
+             The skill receives your input text as /input.txt and can also read all mounted files. \
+             Returns the skill's stdout.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name":  {
+                        "type": "string",
+                        "description": "Skill name — the filename stem without .wasm (e.g. \"pdf_extract\")"
+                    },
+                    "input": {
+                        "type": "string",
+                        "description": "Text passed to the skill as /input.txt. Can be raw content, a file path reference, or structured instructions — depends on the skill."
+                    }
+                },
+                "required": ["name", "input"]
+            }),
+        ));
+    }
+
+    defs
 }
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
@@ -318,7 +346,8 @@ When you have completed a thorough analysis, call `done` with a detailed Markdow
     pub fn run(&mut self, goal: &str, system: &str) -> Result<()> {
         let files = self.sandbox.list_files();
         print_header(files.len(), &self.model_name);
-        let tools = agent_tools();
+        let has_skills = files.iter().any(|f| f.starts_with("/skills/"));
+        let tools = agent_tools(has_skills);
         self.trajectory = Trajectory(Vec::new());
 
         let file_list = files
@@ -326,8 +355,14 @@ When you have completed a thorough analysis, call `done` with a detailed Markdow
             .map(|p| format!("  - {p}"))
             .collect::<Vec<_>>()
             .join("\n");
+        let skill_hint = if has_skills {
+            "\n\nSkills are available. Read /skills/manifest.json to see what's installed, \
+             then use run_skill(name, input) to invoke them for specialised processing."
+        } else {
+            ""
+        };
         let initial_text = format!(
-            "{goal}\n\nMounted files:\n{file_list}\n\nBegin your analysis."
+            "{goal}\n\nMounted files:\n{file_list}{skill_hint}\n\nBegin your analysis."
         );
 
         let mut messages: Vec<Message> = vec![Message::user(initial_text)];
@@ -484,6 +519,13 @@ When you have completed a thorough analysis, call `done` with a detailed Markdow
                     .ok_or_else(|| anyhow::anyhow!("json_query requires path"))?;
                 let pointer = input["pointer"].as_str().unwrap_or("");
                 tools::json_query(&self.sandbox, path, pointer)
+            }
+            "run_skill" => {
+                let name = input["name"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("run_skill requires name"))?;
+                let skill_input = input["input"].as_str().unwrap_or("");
+                self.sandbox.run_skill(name, skill_input)
             }
             "done" => {
                 let summary = input["summary"]
